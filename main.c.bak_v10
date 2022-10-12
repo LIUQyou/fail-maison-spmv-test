@@ -1,0 +1,380 @@
+#include <stdio.h>
+#include <time.h>
+#include <stdlib.h>
+#include <string.h>
+#include "mmio.h"
+#include <math.h>
+#include <libgen.h>
+#include "spmv_csr.h"
+#include "spmv_coo.h"
+#include "spmv_dia.h"
+#include "spmv_ell.h"
+#include "conversions.h"
+#include "utils.h"
+#include "config.h"
+
+// For hugebubbles-00010 on the m400, the MPKI is
+// 26.6 for EXE_TIME 20.0 s
+// 24.2 for EXE_TIME 10.0 s
+// 21.6 for EXE_TIME 5.0 s
+// For a trade-off, select 10.0 s for now
+// #define EXE_TIME 10.0
+
+int main(int argc, char* argv[])
+{
+  int ret_code, r, c, k, status;
+  MM_typecode matcode;
+  FILE *f, *g, *f_anz;
+  int M, N, entries, anz, i, j, *row, *col, *row_ptr, *colind, *offset, *indices, num_diags, stride, num_cols;
+  MYTYPE *x, *y, *val, *dia_data, *ell_data, *coo_val;
+  double v;
+  clock_t start, stop;
+  double sum = 0, mean = 0, sd, variance = 0;
+  unsigned long inner, inner_max = 1000000;
+  double time_span=0;
+
+  #ifndef DENSE
+  if(argc < 3){
+    fprintf(stderr, "Usage: %s [martix-market-filename] [matrix format] [exe time]\n", argv[0]);
+      exit(1);
+  }
+  else{
+    printf("Open matrix file\n");
+    if((f = fopen(argv[1], "r")) == NULL)
+      exit(1);
+  }
+  #endif
+
+  #ifndef DENSE
+  printf("Count non-zeros\n");
+  // name of the optional file which stores the number of non-zero values
+  char anz_file[100];
+  strcpy(anz_file, argv[1]);
+  strcat(anz_file, ".txt");
+  
+  if((f_anz = fopen(anz_file, "r")) == NULL)
+  {
+    // Count the number of non-zeros by enumerating the matrix
+    anz = count_nnz(f);
+    printf("\n -Non-zeros: %d\n",anz);
+    rewind(f);
+  }
+  else
+  {
+    // read the number of non-zeros directly from the file
+    printf(" -Read non-zeros from file\n");
+    fscanf(f_anz, "%d", &anz);
+    printf(" -Non-zeros: %d\n",anz);
+    fclose(f_anz);
+  }
+
+  printf("Read matrix banner\n");
+  if (mm_read_banner(f, &matcode) != 0)
+  {
+    fprintf(stderr, "Could not process Matrix Market banner.\n");
+    exit(1);
+  }
+  if ((ret_code = mm_read_mtx_crd_size(f, &M, &N, &entries)) !=0)
+      exit(1);
+  
+
+  if(M > N) 
+    N = M;
+  else
+    M = N;
+  #endif
+  printf("Malloc row, ");
+  row = (int*)malloc(anz * sizeof(int));
+  if(row == NULL){
+    fprintf(stderr, "couldn't allocate row using malloc");
+    exit(1);
+  }
+  printf("col, ");
+  col = (int*)malloc(anz * sizeof(int));
+  if(col == NULL){
+    fprintf(stderr, "couldn't allocate col using malloc");
+    exit(1);
+  }
+  printf("coo_val, ");
+  coo_val = (MYTYPE*)malloc(anz * sizeof(MYTYPE));
+  if(coo_val == NULL){
+    fprintf(stderr, "couldn't allocate val using malloc");
+    exit(1);
+  }
+  printf("row_ptr, ");
+  row_ptr = (int*)calloc(N+1, sizeof(int));
+  if(row_ptr == NULL){
+    fprintf(stderr, "couldn't allocate row_ptr using malloc");
+    exit(1);
+  }
+  printf("colind, ");
+  colind = (int*)malloc(anz * sizeof(int));
+  if(colind == NULL){
+    fprintf(stderr, "couldn't allocate colind using malloc");
+    exit(1);
+  }
+  printf("val, ");
+  val = (MYTYPE*)malloc(anz * sizeof(MYTYPE));
+  if(val == NULL){
+    fprintf(stderr, "couldn't allocate val using malloc");
+    exit(1);
+  }
+  printf("x, ");
+  x=(MYTYPE*) malloc( sizeof(MYTYPE)*N );
+  if(x == NULL){
+    fprintf(stderr, "couldn't allocate x using malloc");
+    exit(1);
+  }
+  printf("y\n");
+  y=(MYTYPE*) calloc(N, sizeof(MYTYPE));
+  if(y == NULL){
+    fprintf(stderr, "couldn't allocate y using calloc");
+    exit(1);
+  }
+  printf("Initialize input vector\n");
+  init_arr(N,x);
+  
+  #ifndef DENSE
+  // New output part 1/2
+  int bar_len = 30;
+  char s1[31] = "------------------------------";
+  char s2[31] = "                              ";
+  int time_cur;
+  float scale_factor = (float) bar_len / (float) entries;;
+  int check_p = entries/100;
+  if(check_p<1)
+    check_p=1;
+  printf("Number of entries: %d\n", entries);
+
+  k = 0;
+  printf("mm_is_symmetric: %d\n", mm_is_symmetric(matcode));
+  if(mm_is_symmetric(matcode)){
+    printf("mm_is_pattern: %d\n", mm_is_pattern(matcode));
+    if(!mm_is_pattern(matcode)){
+      for (i=0; i<entries; i++){
+        fscanf(f, "%d %d %lf\n", &r, &c, &v);
+        if( v < 0 || v > 0){
+          row[k] = r - 1;
+          col[k]= c - 1;
+          coo_val[k] = v;
+          if(fpclassify(coo_val[k]) == FP_NAN){
+            fprintf(stderr,"bad value : nan\n");
+            exit(1);
+          }
+          if(fpclassify(coo_val[k]) == FP_INFINITE){
+            fprintf(stderr,"bad value : infinite\n");
+            exit(1);
+          }
+          if(fpclassify(coo_val[k]) == FP_SUBNORMAL){
+            fprintf(stderr,"bad value : subnormal\n");
+            coo_val[k] = 0.0;
+          }
+          if(r == c){
+            k++;
+          }
+          else{
+            row[k+1] = col[k]; 
+            col[k+1] = row[k];
+            coo_val[k+1] = v;
+            if(fpclassify(coo_val[k+1]) == FP_SUBNORMAL){
+              fprintf(stderr,"bad value : subnormal\n");
+              coo_val[k+1] = 0.0;
+            }
+            k = k + 2;
+          }
+        }
+        // New output part 2/2
+        if (i%check_p==0)
+        {
+          time_cur = i*scale_factor;
+          fprintf(stderr, "Matrix loading process: |%.*s>%.*s| %.3f\r", time_cur, s1, bar_len-time_cur, s2, (float)(i)/entries);
+          fflush(stderr);  //< Flush the output (just in case)
+        }
+      }
+    }
+    else{
+      for (i=0; i<entries; i++){
+        fscanf(f, "%d %d\n", &r, &c);
+        row[k] = r - 1;
+        col[k]= c - 1;
+        coo_val[k] = 1.0;
+        if(r == c){
+          k++;
+        }
+        else{
+          row[k+1] = col[k]; 
+          col[k+1] = row[k];
+          coo_val[k+1] = 1.0;
+          k = k + 2;
+        }
+        // New output part 2/2
+        if (i%check_p==0)
+        {
+          time_cur = i*scale_factor;
+          fprintf(stderr, "Matrix loading process: |%.*s>%.*s| %.3f\r", time_cur, s1, bar_len-time_cur, s2, (float)(i)/entries);
+          fflush(stderr);  //< Flush the output (just in case)
+        }
+      }
+    }
+  }
+  else {
+    printf("mm_is_pattern: %d\n", mm_is_pattern(matcode));
+    if(!mm_is_pattern(matcode)){
+      for (i=0; i<entries; i++){
+        fscanf(f, "%d %d %lf\n", &r, &c, &v);
+        if( v < 0 || v > 0){
+          row[k] = r - 1;
+          col[k]= c - 1;
+          coo_val[k] = v;
+          if(fpclassify(coo_val[k]) == FP_NAN){
+            fprintf(stderr,"bad value : nan\n");
+            exit(1);
+          }
+          if(fpclassify(coo_val[k]) == FP_INFINITE){
+            fprintf(stderr,"bad value : infinite\n");
+            exit(1);
+          }
+          if(fpclassify(coo_val[k]) == FP_SUBNORMAL){
+            fprintf(stderr,"bad value : subnormal\n");
+            coo_val[k] = 0.0;
+          }
+          k++;
+        }
+        // New output part 2/2
+        if (i%check_p==0)
+        {
+          time_cur = i*scale_factor;
+          fprintf(stderr, "Matrix loading process: |%.*s>%.*s| %.3f\r", time_cur, s1, bar_len-time_cur, s2, (float)(i)/entries);
+          fflush(stderr);  //< Flush the output (just in case)
+        }
+      }
+    }
+    else {
+      for (i=0; i<entries; i++){
+        fscanf(f, "%d %d\n", &r, &c);
+        row[i] = r - 1;
+        col[i]= c - 1;
+        coo_val[i] = 1.0;
+        // New output part 2/2
+        if (i%check_p==0)
+        {
+          time_cur = i*scale_factor;
+          fprintf(stderr, "Matrix loading process: |%.*s>%.*s| %.3f\r", time_cur, s1, bar_len-time_cur, s2, (float)(i)/entries);
+          fflush(stderr);  //< Flush the output (just in case)
+        }
+      }
+    }
+  }
+
+  printf("\nquickSort values\n");
+  quickSort(row, col, coo_val, 0, anz-1);
+  #endif
+  printf("---Start SpMV---\n");
+  double EXE_TIME = atof(argv[3]);
+  int invoke_count=0;
+
+  if(!string_compare(argv[2], "coo")){
+    //status = system("echo \"m5 checkpoint\"");
+    printf("Save m5 checkpoint\n");
+    status = system("m5 checkpoint");
+
+    // Start running for at least EXE_TIME
+    start = clock();
+    while (time_span < EXE_TIME){
+      zero_arr(N, y);
+      status = system("m5 resetstats");
+      spmv_coo(row, col, coo_val, anz, N, x, y);
+      status = system("m5 dumpstats");
+      stop = clock();
+      time_span = ((double)(stop - start)/ CLOCKS_PER_SEC);
+      invoke_count++;
+    }
+
+  }
+
+  if(!string_compare(argv[2], "csr")){
+    printf("Change coo to csr format\n");
+    coo_csr(anz, N, row, col, coo_val, row_ptr, colind, val);
+
+    // status = system("echo \"m5 checkpoint\"");
+    printf("Save m5 checkpoint\n");
+    status = system("m5 checkpoint");
+
+    // Start running for at least EXE_TIME
+    start = clock();
+    while (time_span < EXE_TIME){
+      zero_arr(N, y);
+      status = system("m5 resetstats");
+      spmv_csr(row_ptr, colind, val, N, x, y);
+      status = system("m5 dumpstats");
+      stop = clock();
+      time_span = ((double)(stop - start)/ CLOCKS_PER_SEC);
+      invoke_count++;
+    }
+    
+  }
+
+// For some matrices, dia may drop the eroor: too large
+  if(!string_compare(argv[2], "dia")){
+    printf("Change coo to csr format\n");
+    coo_csr(anz, N, row, col, coo_val, row_ptr, colind, val);
+    printf("Change csr to dia format\n");
+    csr_dia(row_ptr, colind, val, &offset, &dia_data, N, &num_diags, &stride, anz);
+    //status = system("echo \"m5 checkpoint\"");
+    printf("Save m5 checkpoint\n");
+    status = system("m5 checkpoint");
+
+    // Start running for at least EXE_TIME
+    start = clock();
+    while (time_span < EXE_TIME){
+      zero_arr(N, y);
+      status = system("m5 resetstats");
+      spmv_dia(offset, dia_data, N, num_diags, stride, x, y);
+      status = system("m5 dumpstats");
+      stop = clock();
+      time_span = ((double)(stop - start)/ CLOCKS_PER_SEC);
+      invoke_count++;
+    }
+    
+  }
+// For some matrices, ell may drop the eroor: too large
+  if(!string_compare(argv[2], "ell")){
+    printf("Change coo to csr format\n");
+    coo_csr(anz, N, row, col, coo_val, row_ptr, colind, val);
+    printf("Change csr to ell format\n");
+    csr_ell(row_ptr, colind, val, &indices, &ell_data, N, &num_cols, anz);
+    //status = system("echo \"m5 checkpoint\"");
+    printf("Save m5 checkpoint\n");
+    status = system("m5 checkpoint");
+
+    // Start running for at least EXE_TIME
+    start = clock();
+    while (time_span < EXE_TIME){
+      zero_arr(N, y);
+      status = system("m5 resetstats");
+      spmv_ell(indices, ell_data, N, num_cols, x, y);
+      status = system("m5 dumpstats");
+      stop = clock();
+      time_span = ((double)(stop - start)/ CLOCKS_PER_SEC);
+      invoke_count++;
+    }
+  
+  }
+
+  #ifndef DENSE
+  if (f !=stdin) 
+    fclose(f);
+  #endif
+
+  free(x);
+  free(y);
+  free(row_ptr);
+  free(row);
+  free(col);
+  free(coo_val);
+  free(colind);
+  free(val);
+
+  return 0;
+}
+
